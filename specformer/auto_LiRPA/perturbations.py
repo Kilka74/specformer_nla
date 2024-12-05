@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 from auto_LiRPA.utils import logger, eyeC, LinearBound, Patches, BoundList
 import torch.nn.functional as F
-from collections import defaultdict, Sequence, namedtuple
+from collections import defaultdict, namedtuple
+from collections.abc import Sequence
 
 
 

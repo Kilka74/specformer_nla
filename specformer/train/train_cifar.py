@@ -2,6 +2,7 @@ import numpy as np
 import tqdm
 import random
 import time
+import wandb
 from functools import partial
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,7 +11,7 @@ from timm.data import Mixup
 from parser.parser_cifar import get_args
 from auto_LiRPA.utils import MultiAverageMeter
 from train.utils import *
-from checkpoint_saver import CheckpointSaver
+# from checkpoint_saver import CheckpointSaver
 from torch.autograd import Variable
 from robust_evaluate.pgd import evaluate_pgd,evaluate_CW
 from robust_evaluate.fgsm import validate_fgsm
@@ -21,6 +22,8 @@ import os
 args = get_args()
 args.out_origin=args.out_dir
 args.out_dir = args.out_dir+"_"+args.dataset+"_"+args.model+"_"+args.method
+if not args.scratch:
+    args.out_dir = args.out_dir + "_" + "pretrained"
 args.out_dir = args.out_dir +"/seed"+str(args.seed)
 
 
@@ -64,6 +67,7 @@ else:
 
 train_loader, test_loader= get_loaders(args)
 print(args.model)
+print(args.scratch)
 if args.model == "vit_base_patch16_224_sn":
     from model_for_cifar_sn.vit import vit_base_patch16_224_sn
     model = vit_base_patch16_224_sn(pretrained = (not args.scratch),img_size=crop_size,num_classes=args.num_of_class,pen_for_qkv=args.pen_for_qkv,patch_size=args.patch, args=args).cuda()
@@ -78,6 +82,11 @@ elif args.model == "vit_small_patch16_224_sn":
     from model_for_cifar_sn.vit import  vit_small_patch16_224_sn
     model = vit_small_patch16_224_sn(pretrained = (not args.scratch),img_size=crop_size,num_classes=args.num_of_class,pen_for_qkv=args.pen_for_qkv,patch_size=args.patch, args=args).cuda()
     model.init_sn(seed=args.seed);model = nn.DataParallel(model)
+    logger.info('Model{}'.format(model))
+elif args.model == "vit_small_patch16_224":
+    from model_for_cifar.vit import vit_small_patch16_224
+    model = vit_small_patch16_224(pretrained=(not args.scratch), img_size=crop_size, num_classes=args.num_of_class, patch_size=args.patch, args=args).cuda()
+    model = nn.DataParallel(model)
     logger.info('Model{}'.format(model))
 
 
@@ -124,6 +133,7 @@ elif args.model  == "swin_base_patch4_window7_224_sn":
     model = swin_base_patch4_window7_224_sn(pretrained = (not args.scratch),num_classes=args.num_of_class,pen_for_qkv=args.pen_for_qkv).cuda()
     model.init_sn(seed=args.seed);model = nn.DataParallel(model)
     logger.info('Model{}'.format(model))
+
 else:
     raise ValueError("Model doesn't exist！")
 model.train()
@@ -193,6 +203,7 @@ def train_adv(args, model, ds_train, ds_test, logger):
         return 1e-4 + (args.lr_max - 1e-4) * (1 + (math.cos(math.pi * t / 40)))/2
     epoch_s = 0
     evaluate_natural(args, model, test_loader, verbose=False)
+
     for epoch in tqdm.tqdm(range(epoch_s + 1, args.epochs + 1)):
         train_loss = 0
         Spe_loss = 0
@@ -200,16 +211,22 @@ def train_adv(args, model, ds_train, ds_test, logger):
         train_n = 0
 
         def train_step(X, y,t,mixup_fn):
+            spe_loss = 0
             model.train()
             if args.method == "CLEAN":
                 X = X.cuda()
                 y = y.cuda()
                 if mixup_fn is not None:
                     X, y = mixup_fn(X, y)
-                output,spe_loss = model(X)
-                spe_loss=spe_loss.mean()
-                cls_loss = criterion(output, y)
-                loss=cls_loss + spe_loss *args.trade_off
+                output = model(X)
+                if type(output) == tuple:
+                    output,spe_loss = output[0], output[1]
+                    spe_loss=spe_loss.mean()
+                    cls_loss = criterion(output, y)
+                    loss=cls_loss + spe_loss *args.trade_off
+                else:
+                    cls_loss = criterion(output, y)
+                    loss = cls_loss
             elif args.method == 'AT':
                 X = X.cuda()
                 y = y.cuda()
@@ -235,10 +252,15 @@ def train_adv(args, model, ds_train, ds_test, logger):
                     return delta
                 delta = pgd_attack()
                 X_adv = X + delta
-                output,spe_loss = model(X_adv)
-                spe_loss=spe_loss.mean()
-                cls_loss = criterion(output, y)
-                loss=cls_loss + spe_loss *args.trade_off
+                output = model(X_adv)
+                if type(output) == tuple:
+                    output,spe_loss = output[0], output[1]
+                    spe_loss=spe_loss.mean()
+                    cls_loss = criterion(output, y)
+                    loss=cls_loss + spe_loss *args.trade_off
+                else:
+                    cls_loss = criterion(output, y)
+                    loss = cls_loss
             else:
                 raise ValueError(args.method)
             opt.zero_grad()
@@ -278,6 +300,12 @@ def train_adv(args, model, ds_train, ds_test, logger):
                     opt.param_groups[0]['lr'],
                            train_loss / train_n, Spe_loss/train_n ,train_acc / train_n
                 ))
+                wandb.log({
+                    "train_loss": train_loss / train_n,
+                    "Spe_loss": Spe_loss / train_n,
+                    "train_acc": train_acc / train_n,
+                    "lr": opt.param_groups[0]['lr']
+                }, step=epoch*steps_per_epoch+step+1)
             lr = lr_schedule(epoch_now)
             opt.param_groups[0].update(lr=lr)
         path = os.path.join(args.out_dir, 'checkpoint_{}'.format(epoch))
@@ -299,13 +327,24 @@ def train_adv(args, model, ds_train, ds_test, logger):
         else:
             with open(os.path.join(args.out_dir, 'test_acc.txt'), 'a') as new:
                 meter_test = evaluate_natural(args, model, test_loader, verbose=False)
+                wandb.log({
+
+                }, step=(epoch+1)*steps_per_epoch)
                 new.write('{}\n'.format(meter_test))
 
-        if epoch == args.epochs:
-            torch.save({'state_dict': model.state_dict(), 'epoch': epoch, 'opt': opt.state_dict()}, path)
-            logger.info('Checkpoint saved to {}'.format(path))
+        # if epoch == args.epochs:
+        torch.save({'state_dict': model.state_dict(), 'epoch': epoch, 'opt': opt.state_dict()}, f"{path}.pth")
+        logger.info('Checkpoint saved to {}'.format(path))
             
 
+wandb.login(key="9f8480fbfcfd1d06b91b59aa5d23ed5482fdee2e", relogin=True)
+
+wandb.init(
+    entity="kilka74",
+    project="specformer_exploration",
+    name=f"{args.model}_{args.method}_{args.dataset}_{args.pen_for_qkv}",
+    config=args
+)
 
 
 train_adv(args, model, train_loader, test_loader, logger)
@@ -322,17 +361,28 @@ def evaluate(args,model,test_loader,logger,epoch,flag="last"):
         logger.info('cw20 : loss {:.4f} acc {:.4f}'.format(cw_loss, cw_acc))
 
 
-        pgd_loss, pgd_acc20 = evaluate_pgd(args, model, test_loader)
-        logger.info('PGD20 : loss {:.4f} acc {:.4f}'.format(pgd_loss, pgd_acc20))
+        pgd_loss20, pgd_acc20 = evaluate_pgd(args, model, test_loader)
+        logger.info('PGD20 : loss {:.4f} acc {:.4f}'.format(pgd_loss20, pgd_acc20))
 
 
-        args.eval_iters = 100
-        pgd_loss, pgd_acc100 = evaluate_pgd(args, model, test_loader)
-        logger.info('PGD100 : loss {:.4f} acc {:.4f}'.format(pgd_loss, pgd_acc100))
+        # args.eval_iters = 100
+        # pgd_loss100, pgd_acc100 = evaluate_pgd(args, model, test_loader)
+        # logger.info('PGD100 : loss {:.4f} acc {:.4f}'.format(pgd_loss100, pgd_acc100))
         
-        at_path = os.path.join(args.out_dir, 'result_'+'_autoattack.txt')
-        aa_acc=evaluate_aa(args, model,at_path, args.AA_batch)
-        logger.info('AutoAttack : acc {:.4f}'.format( aa_acc))
+        # at_path = os.path.join(args.out_dir, 'result_'+'_autoattack.txt')
+        # logger.info("Starting AutoAttack evaluation")
+        # aa_acc=evaluate_aa(args, model,at_path, args.AA_batch)
+        # logger.info('AutoAttack : acc {:.4f}'.format( aa_acc))
+        wandb.log({
+            "final_test_acc": nat,
+            "CW-20_loss": cw_loss,
+            "CW-20_acc": cw_acc,
+            "PGD-20_loss": pgd_loss20,
+            "PGD-20_acc": pgd_acc20,
+            # "PGD-100_loss": pgd_loss100,
+            # "PGD-100_acc": pgd_acc100,
+            # "AutoAttack_accuracy": aa_acc
+        })
 
 
     else:
@@ -348,16 +398,21 @@ def evaluate(args,model,test_loader,logger,epoch,flag="last"):
 
         fgsm=validate_fgsm(args, model,logger,test_loader,'cuda',2)
         fgsm=round(fgsm.item(),4)
+        # logger.info("Starting AutoAttack evaluation")
+        # at_path = os.path.join(args.out_dir, 'result_'+'_autoattack.txt')
+        # aa_acc=evaluate_aa(args, model,at_path, args.AA_batch)
+        wandb.log({
+            "final_test_acc": nat,
+            "PGD-2_loss": pgd_loss,
+            "PGD-2_acc": pgd_acc2,
+            "FGSM": fgsm,
+            # "AutoAttack_accuracy": aa_acc
+        })
 
 
 evaluate(args,model,test_loader,logger,epoch=args.epochs)
 
-
-
-
-
-
-
+wandb.finish()
 
 
 
