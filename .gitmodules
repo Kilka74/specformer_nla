@@ -1,0 +1,3 @@
+[submodule "specformer/specformer_nla"]
+	path = specformer/specformer_nla
+	url = https://kilka74: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@huggingface.co/kilka74/specformer_nla

@@ -337,10 +337,10 @@ def train_adv(args, model, ds_train, ds_test, logger):
         logger.info('Checkpoint saved to {}'.format(path))
             
 
-wandb.login(key="9f8480fbfcfd1d06b91b59aa5d23ed5482fdee2e", relogin=True)
+wandb.login(key="", relogin=True)
 
 wandb.init(
-    entity="kilka74",
+    entity="kilka74", # choose your own
     project="specformer_exploration",
     name=f"{args.model}_{args.method}_{args.dataset}_{args.pen_for_qkv}",
     config=args
