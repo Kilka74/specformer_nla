@@ -159,6 +159,10 @@ class Attention(nn.Module):
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
         self.pen_for_qkv=pen_for_qkv
+        if (pen_for_qkv is not None) and len(pen_for_qkv) == 2:
+            self.joint = True
+        else:
+            self.joint = False
         self.qkv = nn.Linear(dim, dim*3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
@@ -167,28 +171,36 @@ class Attention(nn.Module):
 
     def init_uv(self):
         Wq,Wk,Wv=self.qkv.weight.chunk(3,dim=0)#这里是不是也要fix seed啊
+        
         u1 = torch.nn.Parameter(Wq.data.new(self.num_heads,Wq.shape[0]).normal_(0, 1), requires_grad=False)
         u2 = torch.nn.Parameter(Wq.data.new(self.num_heads,Wq.shape[0]).normal_(0, 1), requires_grad=False)
-        u3 = torch.nn.Parameter(Wq.data.new(self.num_heads,Wq.shape[0]).normal_(0, 1), requires_grad=False)
         
         v1 = torch.nn.Parameter(Wq.data.new(self.num_heads,Wq.shape[0]//self.num_heads).normal_(0, 1), requires_grad=False)
         v2 = torch.nn.Parameter(Wq.data.new(self.num_heads,Wq.shape[0]//self.num_heads).normal_(0, 1), requires_grad=False)
-        v3 = torch.nn.Parameter(Wq.data.new(self.num_heads,Wq.shape[0]//self.num_heads).normal_(0, 1), requires_grad=False)
         
         u1.data = l2normalize(u1.data)
         u2.data = l2normalize(u2.data)
-        u3.data = l2normalize(u3.data)
         v1.data = l2normalize(v1.data)
         v2.data = l2normalize(v2.data)
-        v3.data = l2normalize(v3.data)
 
-        self.register_parameter("Wq_u", u1)
-        self.register_parameter("Wk_u", u2)
+        if not self.joint:
+            self.register_parameter("Wq_u", u1)
+            self.register_parameter("Wk_u", u2)
+            self.register_parameter("Wq_v", v1)
+            self.register_parameter("Wk_v", v2)
+            self.dict={0:'Wq',1:'Wk',2:'Wv'}
+        else:
+            self.register_parameter("Wqk_u", u1)
+            self.register_parameter("Wqk_v", u2)
+            self.dict = {0:"Wqk", 1:"Wv"}
+
+        u3 = torch.nn.Parameter(Wq.data.new(self.num_heads,Wq.shape[0]).normal_(0, 1), requires_grad=False)
+        v3 = torch.nn.Parameter(Wq.data.new(self.num_heads,Wq.shape[0]//self.num_heads).normal_(0, 1), requires_grad=False)
+
+        u3.data = l2normalize(u3.data)
+        v3.data = l2normalize(v3.data)
         self.register_parameter("Wv_u", u3)
-        self.register_parameter("Wq_v", v1)
-        self.register_parameter("Wk_v", v2)
         self.register_parameter("Wv_v", v3)
-        self.dict={0:'Wq',1:'Wk',2:'Wv'}
         
     def calculate_per_head(self,W,i):
         W=W.reshape(W.shape[0],self.num_heads,-1)#[384,6,64]
@@ -204,14 +216,36 @@ class Attention(nn.Module):
             sigma=torch.matmul(torch.matmul(u[h],W[:,h,:]),v[h])
             Sigma+=sigma**2
         return Sigma
-            
+
+
+    def calculate_per_head_for_joint_qk(self, Wq, Wk, i):
+        Wq = Wq.reshape(Wq.shape[0], self.num_heads, -1)
+        Wk = Wk.reshape (Wk.shape[0], self.num_heads, -1)
+        u = getattr(self, self.dict[i]+"_u")
+        v = getattr(self, self.dict[i]+"_v")
+        Sigma = 0
+        for h in range(self.num_heads):
+            with torch.no_grad():
+                wq, wk = Wq[:, h, :], Wk[:, h, :]
+                v[h] = l2normalize(torch.matmul(wk, torch.matmul(wq.T, u[h])))
+                u[h] = l2normalize(torch.matmul(wq, torch.matmul(wk.T, v[h])))
+        for h in range(self.num_heads):
+            sigma=torch.matmul(torch.matmul(u[h], Wq[:, h, :]), torch.matmul(Wk[:, h, :].T, v[h]))
+            Sigma += sigma**2
+        return Sigma
+
+
     def calculate(self):
         W=self.qkv.weight.chunk(3,dim=0)
         spe_loss=0
-        for i in range(3):
-            if self.pen_for_qkv[i]:
-                sigma=self.calculate_per_head(W[i],i)
-                spe_loss+=self.pen_for_qkv[i]*sigma
+        if not self.joint:
+            for i in range(3):
+                if self.pen_for_qkv[i]:
+                    sigma=self.calculate_per_head(W[i],i)
+                    spe_loss+=self.pen_for_qkv[i]*sigma
+        else:
+            spe_loss += self.calculate_per_head_for_joint_qk(W[0], W[1], 0) * self.pen_for_qkv[0]
+            spe_loss += self.calculate_per_head(W[2], 1) * self.pen_for_qkv[1]
         return spe_loss
     
     def calculate2(self,x): #除以std这个也要重新搞
